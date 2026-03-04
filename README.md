@@ -9,7 +9,7 @@ First up in my series of **TWIL aka "This Week I Learnt"**: Building a complete 
 | # | What | Status |
 |---|------|--------|
 | 1 | Tensor class + math primitives (matmul, softmax, layernorm, gelu) | ✅ Done |
-| 2 | GPT-2 forward pass (full architecture, random weights, shape-verified) | ✅ Done |
+| 2 | GPT-2 forward pass (full architecture, random weights, shape-verified) | WIP |
 | 3 | Real weight loading + BPE tokeniser + end-to-end text generation | TODO |
 
 ---
