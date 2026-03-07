@@ -11,7 +11,7 @@
 //   4. LM head produces a proper distribution after softmax
 //   5. The full GPT-2 small config instantiates without crashing
 
-#include "gpt2.h"
+#include "../gpt2.h"
 #include <cstdio>
 #include <cmath>
 #include <algorithm>  // std::max_element
