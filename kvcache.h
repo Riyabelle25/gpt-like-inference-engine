@@ -1,5 +1,5 @@
 #pragma once
-// kvcache.h — KV-Cache + Autoregressive decoding.
+// kvcache.h - KV-Cache + Autoregressive decoding.
 // ===========================================================================
 // KV Caching:
 // ===========================================================================
@@ -35,11 +35,36 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <thread>
+#include <vector>
 
 // ===========================================================================
-// LayerKVCache — stores K and V vectors for one transformer block.
+// Milestone 5: Multi-threaded attention heads
 // ===========================================================================
-// K_cache shape: {max_seq, d_model}  — one row per cached token
+// GPT-2 small has 12 attention heads per layer.  Each head is completely
+// independent - head h only reads q_ptr+h*d_head, K_cache columns [h*d_head],
+// and V_cache columns [h*d_head], and writes attn_out[h*d_head].
+//
+// There are NO data dependencies between heads, so we can run them in parallel
+// using std::thread.  We use a simple static partition: divide the 12 heads
+// into N_THREADS chunks and give each chunk to one thread.
+//
+// std::thread is used instead of a thread pool to keep zero dependencies.
+// Thread creation overhead (~10–50 µs) is small compared to the attention
+// compute cost (~milliseconds) for any non-trivial context length.
+//
+// Set N_THREADS to the number of physical cores you want to use.
+// Default = hardware_concurrency() clamped to n_heads.
+inline int get_num_threads(int n_heads) {
+    int hw = (int)std::thread::hardware_concurrency();
+    if (hw <= 0) hw = 2;
+    return std::min(hw, n_heads);
+}
+
+// ===========================================================================
+// LayerKVCache - stores K and V vectors for one transformer block.
+// ===========================================================================
+// K_cache shape: {max_seq, d_model}  - one row per cached token
 // V_cache shape: {max_seq, d_model}
 // n_cached: how many positions have been filled so far
 struct LayerKVCache {
@@ -85,13 +110,13 @@ struct KVCache {
 
 
 // ===========================================================================
-// attention_cached() — single-token attention using the KV-cache.
+// attention_cached() - single-token attention using the KV-cache.
 // ===========================================================================
-// INPUT:  x_t   {d_model}   — the single new token's hidden state
-//         bw                — block weights
-//         cache             — K/V cache for this layer (will be updated)
+// INPUT:  x_t   {d_model}   - the single new token's hidden state
+//         bw                - block weights
+//         cache             - K/V cache for this layer (will be updated)
 //         cfg
-// OUTPUT: {d_model}         — attended output for this token
+// OUTPUT: {d_model}         - attended output for this token
 //
 // This is called during the DECODE phase (one token at a time).
 // During PREFILL we use the original attention() which handles seq_len > 1.
@@ -121,53 +146,74 @@ inline Tensor attention_cached(const Tensor& x_t,
     int n_ctx = cache.n_cached;  // total context length including this token
 
     // -----------------------------------------------------------------------
-    // Step 3: Multi-head attention — this token attends to ALL cached positions
+    // Step 3: Multi-head attention - parallel over heads (Milestone 5)
     // -----------------------------------------------------------------------
-    // Q from this token: shape {n_heads, d_head}
-    // K_cache[0..n_ctx-1]: each row is {d_model} = {n_heads * d_head}
-    //
-    // For each head h:
-    //   q_h = q_ptr + h*d_head              (length d_head)
-    //   k_h[j] = K_cache[j] + h*d_head      (length d_head, for j=0..n_ctx-1)
-    //   score[j] = dot(q_h, k_h[j]) / sqrt(d_head)
-    //   weights = softmax(score)             (length n_ctx — no mask needed!
-    //                                         we only have one Q, and it can
-    //                                         attend to all past K positions)
-    //   out_h = sum_j(weights[j] * v_h[j])  (length d_head)
+    // Each head h is completely independent:
+    //   - reads: q_ptr[h*d_head .. (h+1)*d_head)
+    //            K_cache[:,  h*d_head .. (h+1)*d_head)   (strided by d_model)
+    //            V_cache[:,  h*d_head .. (h+1)*d_head)
+    //   - writes: attn_out[h*d_head .. (h+1)*d_head)
+    // Thread partition: divide n_heads evenly across N threads.
+    //   e.g. 12 heads, 4 threads -> threads process heads [0-2], [3-5], [6-8], [9-11]
 
     float scale = 1.0f / std::sqrt((float)d_head);
-    Tensor attn_out({d_model});  // output for this token, all heads concatenated
+    Tensor attn_out({d_model});  // output buffer - each head writes its own slice
 
-    for (int h = 0; h < n_heads; ++h) {
-        int head_off = h * d_head;
+    // Lambda that processes a range of heads [h_start, h_end)
+    // All captured pointers are read-only (cache, qkv) or write to
+    // non-overlapping slices (attn_out), so there are no data races.
+    auto process_heads = [&](int h_start, int h_end) {
+        for (int h = h_start; h < h_end; ++h) {
+            int head_off = h * d_head;
+            const float* q_h = q_ptr + head_off;
 
-        const float* q_h = q_ptr + head_off;
+            // Score = dot(q_h, K_cache[j][head_off..]) * scale  for j in [0, n_ctx)
+            std::vector<float> scores(n_ctx);
+            for (int j = 0; j < n_ctx; ++j) {
+                const float* k_j = cache.K_cache.data.data() + j * d_model + head_off;
+                float dot = 0.0f;
+                for (int k = 0; k < d_head; ++k)
+                    dot += q_h[k] * k_j[k];
+                scores[j] = dot * scale;
+            }
 
-        // Compute attention scores for all cached positions
-        // scores[j] = dot(q_h, K_cache[j][head_off..head_off+d_head]) * scale
-        std::vector<float> scores(n_ctx);
-        for (int j = 0; j < n_ctx; ++j) {
-            const float* k_j = cache.K_cache.data.data() + j * d_model + head_off;
-            float dot = 0.0f;
-            for (int k = 0; k < d_head; ++k)
-                dot += q_h[k] * k_j[k];
-            scores[j] = dot * scale;
+            // Softmax over scores
+            Tensor scores_t(std::vector<float>(scores.begin(), scores.end()), {n_ctx});
+            softmax(scores_t);
+
+            // Weighted sum of V values -> write into this head's slice of attn_out
+            float* out_h = attn_out.data.data() + head_off;
+            for (int k = 0; k < d_head; ++k) out_h[k] = 0.0f;
+            for (int j = 0; j < n_ctx; ++j) {
+                const float* v_j = cache.V_cache.data.data() + j * d_model + head_off;
+                float w = scores_t.data[j];
+                for (int k = 0; k < d_head; ++k)
+                    out_h[k] += w * v_j[k];
+            }
         }
+    };
 
-        // Softmax over scores (no causal mask needed: only one query, all
-        // positions it attends to are already in the past)
-        Tensor scores_t(std::vector<float>(scores.begin(), scores.end()), {n_ctx});
-        softmax(scores_t);
-
-        // Weighted sum of V values
-        float* out_h = attn_out.data.data() + head_off;
-        for (int k = 0; k < d_head; ++k) out_h[k] = 0.0f;
-        for (int j = 0; j < n_ctx; ++j) {
-            const float* v_j = cache.V_cache.data.data() + j * d_model + head_off;
-            float w = scores_t.data[j];
-            for (int k = 0; k < d_head; ++k)
-                out_h[k] += w * v_j[k];
+    // Dispatch threads - each thread owns a contiguous slice of heads
+    int n_threads = get_num_threads(n_heads);
+    if (n_threads <= 1) {
+        // Single-threaded fast path - avoids thread creation overhead when
+        // hardware_concurrency() == 1 or the user sets N_THREADS=1
+        process_heads(0, n_heads);
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(n_threads);
+        int heads_per_thread = n_heads / n_threads;
+        int remainder        = n_heads % n_threads;
+        int start = 0;
+        for (int t = 0; t < n_threads; ++t) {
+            // Distribute the remainder one head at a time to early threads
+            int count = heads_per_thread + (t < remainder ? 1 : 0);
+            int end   = start + count;
+            threads.emplace_back(process_heads, start, end);
+            start = end;
         }
+        // Wait for all threads to complete before proceeding
+        for (auto& th : threads) th.join();
     }
 
     // -----------------------------------------------------------------------
@@ -180,7 +226,7 @@ inline Tensor attention_cached(const Tensor& x_t,
 
 
 // ===========================================================================
-// transformer_block_cached() — one block, single-token, using KV-cache.
+// transformer_block_cached() - one block, single-token, using KV-cache.
 // ===========================================================================
 inline Tensor transformer_block_cached(const Tensor& x_t,
                                         const BlockWeights& bw,
@@ -218,7 +264,7 @@ inline Tensor transformer_block_cached(const Tensor& x_t,
 
 
 // ===========================================================================
-// prefill() — run the full forward pass on the prompt, populate KV-cache.
+// prefill() - run the full forward pass on the prompt, populate KV-cache.
 // ===========================================================================
 // Returns the logits for the LAST token (the prediction for the next token).
 // Also populates cache.layers[i] with K/V for every prompt position.
@@ -307,7 +353,7 @@ inline Tensor prefill(const std::vector<int>& token_ids,
 
 
 // ===========================================================================
-// decode_step() — generate ONE new token using the KV-cache.
+// decode_step() - generate ONE new token using the KV-cache.
 // ===========================================================================
 // token_id: the previously generated (or last prompt) token
 // pos:      its absolute position in the sequence
