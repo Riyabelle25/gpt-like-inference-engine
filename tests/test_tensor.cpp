@@ -1,6 +1,6 @@
 // test_tensor.cpp — test suite for checkpt 1: Tensor + Math primitives 
 
-#include "tensor.h"
+#include "../tensor.h"
 #include <cstdio>
 #include <cmath>
 
